@@ -72,12 +72,24 @@ import {
 import { runtimeMetadataPath } from "./runtime-paths.js";
 import { createStartupStderrCapture } from "./cli/startup-stderr.js";
 import {
+  configStartsAgentmemoryWorker,
+  probeEngine,
+  probeWorker,
+  startWorkerAndWait,
+  startupDeadline,
+  startupTimeoutMessage,
+  startupTimeouts,
+  waitForReadiness,
+  withinStartupDeadline,
+  type StartupDeadline,
+} from "./cli/readiness.js";
+import {
   clearPersistedBuiltinConfig,
   engineFlushWaitMs,
   engineStateConfigPaths,
   renderEngineConfig,
 } from "./cli/engine-config.js";
-import { SHUTDOWN_HARD_EXIT_MS } from "./shutdown.js";
+import { SHUTDOWN_HARD_EXIT_MS, registerStartupCleanup, runStartupCleanup } from "./shutdown.js";
 import { consoleArgs, defaultConsolePort, parseConsoleArgs } from "./cli/console.js";
 import { processStatIsRunning } from "./cli/process-state.js";
 import { renderSplash } from "./cli/splash.js";
@@ -93,6 +105,8 @@ const ALL_TOOLS_COUNT = getAllTools().length;
 const CORE_TOOLS_COUNT = getAllTools().filter((t) => ESSENTIAL_TOOLS.has(t.name)).length;
 import { resolveDataDir } from "./cli-data-dir.js";
 import { runCaptureCommand } from "./cli/capture.js";
+import { runCompressionCommand } from "./cli/compression.js";
+import { runGraphIndexCommand } from "./cli/graph-index.js";
 import { bearerHeaders, resolveClientSecret } from "./secret-store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -227,6 +241,13 @@ Commands:
   capture [--drain]  Show capture health: the local offline spool and the server
                      inbox (pending, retrying, dead letters). --drain sends
                      spooled observations now. --json for machine output.
+  compression        Inspect pending or failed observation compression.
+                     --session <id> or --project <name> selects the scope.
+                     --agent-id <id> narrows it; --limit <N> bounds the batch.
+                     --retry explicitly retries compression; --json for machine output.
+  graph-index       Inspect bounded graph index status. --json for machine output.
+                     migrate --allow-legacy-scan explicitly scans legacy graph data.
+                     resume continues a sealed migration without another full scan.
   import-jsonl [p]   Import Claude Code JSONL transcripts (default: ~/.claude/projects)
                      --max-files <N> | --max-files=<N>: override scan cap (default 200, max 1000;
                      out-of-range is rejected; for trees >1000 files, batch by subdirectory)
@@ -255,6 +276,14 @@ Environment:
   AGENTMEMORY_III_CONFIG       Engine config to start from (default: ./iii-config.yaml,
                                then ~/.agentmemory/iii-config.yaml, then the bundled
                                loopback-only config).
+  AGENTMEMORY_ENGINE_READY_TIMEOUT_MS
+                               Engine readiness deadline in milliseconds (default 120000).
+  AGENTMEMORY_READY_TIMEOUT_MS
+                               Worker readiness deadline in milliseconds (default 300000).
+                               Both deadlines accept integers from 1 through 3600000.
+  AGENTMEMORY_ENGINE_MANAGES_WORKER
+                               true for custom engine-managed worker wrappers; false
+                               for CLI-managed workers. Unset detects direct worker commands.
   AGENTMEMORY_FOLLOWUP_WINDOW_SECONDS
                                Window (seconds) for the smart-search follow-up diagnostic
                                (default 30). Long values overcount, short values undercount.
@@ -282,7 +311,7 @@ if (toolsIdx !== -1 && args[toolsIdx + 1]) {
   process.env["AGENTMEMORY_TOOLS"] = toolsMode;
 }
 
-const URL_CLIENT_COMMANDS = new Set(["status", "doctor", "mcp", "capture"]);
+const URL_CLIENT_COMMANDS = new Set(["status", "doctor", "mcp", "capture", "compression", "graph-index"]);
 let hasExplicitLocalPortOverride = false;
 let selectedInstance = 0;
 
@@ -459,36 +488,17 @@ function getEnginePort(): number {
 }
 
 async function isEngineRunning(): Promise<boolean> {
-  try {
-    await fetch(`${getBaseUrl()}/`, {
-      signal: AbortSignal.timeout(2000),
-    });
-    return true;
-  } catch {
-    return false;
-  }
+  const result = await withinStartupDeadline(startupDeadline(2000), (signal) => probeEngine(getBaseUrl(), signal)).catch(() => null);
+  return result?.completed === true && result.value;
 }
 
 async function isAgentmemoryReady(): Promise<boolean> {
-  try {
-    const res = await fetch(`${getBaseUrl()}/agentmemory/livez`, {
-      signal: AbortSignal.timeout(2000),
-    });
-    if (!res.ok) return false;
-    try {
-      const data = await res.json() as { viewerPort?: number | null; viewerSkipped?: boolean };
-      if (typeof data.viewerPort === "number") {
-        discoveredViewerPort = data.viewerPort;
-        return true;
-      }
-      if (data.viewerSkipped) return true;
-      return false;
-    } catch {
-      return false;
-    }
-  } catch {
-    return false;
-  }
+  const result = await withinStartupDeadline(startupDeadline(2000), workerReadinessProbe).catch(() => null);
+  return result?.completed === true && result.value;
+}
+
+function workerReadinessProbe(signal: AbortSignal): Promise<boolean> {
+  return probeWorker(getBaseUrl(), signal, (port) => { discoveredViewerPort = port; });
 }
 
 function findIiiConfig(): string {
@@ -646,6 +656,7 @@ function engineStatePath(): string {
 type NativeEngineState = {
   kind: "native";
   configPath: string;
+  cwd?: string;
   attached?: boolean;
   binPath?: string;
   restPort?: number;
@@ -767,36 +778,65 @@ function engineStateRestPort(state: EngineState): number {
   return 3111;
 }
 
-async function startWorkerForEngineState(): Promise<void> {
-  const workerPid = readWorkerPidfile();
-  if (workerPid && pidAlive(workerPid)) return;
-  if (configuredEngineMayStartWorker() && await waitForConfiguredWorker(5000)) {
-    return;
+async function startWorkerForEngineState(background = false): Promise<void> {
+  const timeoutMs = startupTimeouts().workerMs;
+  startupWorkerFailure = null;
+  const ready = await startWorkerAndWait({
+    timeoutMs,
+    hasLiveWorker: () => {
+      const workerPid = readWorkerPidfile();
+      return Boolean(workerPid && pidAlive(workerPid));
+    },
+    engineStartsWorker: configuredEngineMayStartWorker,
+    startWorker: async () => {
+      if (background) {
+        const builtEntry = join(__dirname, "index.mjs");
+        const workerArgs = existsSync(builtEntry)
+          ? [builtEntry]
+          : ["--import", "tsx", join(__dirname, "index.ts")];
+        const child = spawn(process.execPath, workerArgs, {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true,
+          env: { ...process.env },
+        });
+        spawnedStartupWorker = child;
+        child.on("error", (error) => {
+          if (spawnedStartupWorker === child) startupWorkerFailure = error;
+        });
+        child.on("exit", (code, signal) => {
+          if (spawnedStartupWorker === child) startupWorkerFailure = new Error(`agentmemory worker exited during startup (${signal ?? code}).`);
+        });
+        child.unref();
+      } else {
+        importedStartupWorker = true;
+        await import("./index.js");
+      }
+    },
+    probe: workerReadinessProbe,
+    stopped: () => startupInterrupted || engineStartupFailed() || startupWorkerFailure !== null,
+  });
+  if (!ready) {
+    if (startupWorkerFailure) throw startupWorkerFailure;
+    if (engineStartupFailed()) throw new Error("iii-engine exited before the agentmemory worker became ready.");
+    throw new Error(startupTimeoutMessage("worker", timeoutMs));
   }
-  await import("./index.js");
+  finishStartup();
 }
 
 function configuredEngineMayStartWorker(): boolean {
+  const explicit = startupTimeouts().engineManagesWorker;
+  if (explicit !== undefined) return explicit;
   const state = readEngineState();
-  if (state?.kind !== "native") return false;
+  if (state?.kind !== "native" || state.attached) return false;
   try {
     const raw = readFileSync(state.configPath, "utf-8");
-    return raw.includes("- name: iii-exec");
+    return configStartsAgentmemoryWorker(raw, join(__dirname, "index.mjs"), state.cwd);
   } catch {
     return false;
   }
 }
 
-async function waitForConfiguredWorker(timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const workerPid = readWorkerPidfile();
-    if (workerPid && pidAlive(workerPid)) return true;
-    if (await isAgentmemoryReady()) return true;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  return false;
-}
 
 function discoverComposeFile(): string | null {
   const candidates = [
@@ -856,6 +896,8 @@ function inspectDockerContainer(
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "ignore"],
     maxBuffer: 1024 * 1024,
+    timeout: 5000,
+    killSignal: "SIGKILL",
   });
   if (result.status !== 0) {
     return { status: "unavailable", reason: `docker inspect failed for ${containerId}` };
@@ -1025,7 +1067,7 @@ function inspectOwnedDockerEngine(state: EngineState): DockerEngineInspection {
           "--all",
           "iii-engine",
         ]),
-        { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000, killSignal: "SIGKILL" },
       );
       if (psResult.status === 0) {
         for (const id of (psResult.stdout ?? "").trim().split(/\s+/)) {
@@ -1052,7 +1094,7 @@ function inspectOwnedDockerEngine(state: EngineState): DockerEngineInspection {
     const scanResult = spawnSync(
       dockerBin,
       scanArgs,
-      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000, killSignal: "SIGKILL" },
     );
     if (scanResult.status === 0) {
       for (const id of (scanResult.stdout ?? "").trim().split(/\s+/)) {
@@ -1383,6 +1425,92 @@ type StartupFailure = {
 
 let startupFailure: StartupFailure | null = null;
 let activeStartupStderr = createStartupStderrCapture();
+let spawnedNativeEngine: ChildProcess | null = null;
+let importedStartupWorker = false;
+let spawnedStartupWorker: ChildProcess | null = null;
+let startupWorkerFailure: Error | null = null;
+let spawnedDockerCommand: ChildProcess | null = null;
+let startedDockerEngine: DockerEngineState | null = null;
+let engineReadinessDeadline: StartupDeadline | null = null;
+let startupInterrupted = false;
+let finishStartup = (): void => {};
+
+function beginStartup(): void {
+  finishStartup();
+  startupInterrupted = false;
+  const unregister = registerStartupCleanup(cleanupFailedStartup);
+  const interrupt = async (exitCode: number): Promise<void> => {
+    startupInterrupted = true;
+    process.exit(await runStartupCleanup(exitCode).catch(() => exitCode));
+  };
+  const onInterrupt = () => { void interrupt(130); };
+  const onTerminate = () => { void interrupt(143); };
+  process.on("SIGINT", onInterrupt);
+  process.on("SIGTERM", onTerminate);
+  finishStartup = () => {
+    process.off("SIGINT", onInterrupt);
+    process.off("SIGTERM", onTerminate);
+    unregister();
+    finishStartup = () => {};
+  };
+}
+
+function engineStartupFailed(): boolean {
+  return startupFailure?.kind === "engine-crashed" || startupFailure?.kind === "docker-crashed";
+}
+
+async function cleanupFailedStartup(): Promise<void> {
+  engineReadinessDeadline = null;
+  if (importedStartupWorker && readWorkerPidfile() === process.pid) clearWorkerPidfile();
+  const worker = spawnedStartupWorker;
+  spawnedStartupWorker = null;
+  if (worker && typeof worker.pid === "number") {
+    if (worker.exitCode === null && worker.signalCode === null && !(await signalAndWait(worker.pid, "SIGTERM", 3000))) {
+      p.log.warn(`Started worker pid ${worker.pid} survived shutdown; lifecycle state was preserved.`);
+      return;
+    }
+    if (readWorkerPidfile() === worker.pid) clearWorkerPidfile();
+  }
+  const dockerCommand = spawnedDockerCommand;
+  spawnedDockerCommand = null;
+  if (dockerCommand && typeof dockerCommand.pid === "number" && dockerCommand.exitCode === null && dockerCommand.signalCode === null) {
+    await signalAndWait(dockerCommand.pid, "SIGTERM", 1000);
+  }
+  const dockerState = startedDockerEngine;
+  startedDockerEngine = null;
+  if (dockerState) {
+    const inspection = inspectOwnedDockerEngine(dockerState);
+    if (inspection.status === "running" || inspection.status === "stopped") {
+      persistDockerInspection(dockerState, inspection);
+      const dockerBin = whichBinary("docker");
+      if (inspection.status === "running" && dockerBin) {
+        runCommand(dockerBin, ["stop", "--time", "10", inspection.containerId], {
+          label: "Stopping the Docker container started by this invocation",
+          timeoutMs: 15_000,
+        });
+      }
+    } else {
+      p.log.warn("Docker startup ownership could not be verified for cleanup; project state was preserved for `agentmemory stop`.");
+    }
+  }
+  const child = spawnedNativeEngine;
+  spawnedNativeEngine = null;
+  if (!child || typeof child.pid !== "number") return;
+  if (!IS_WINDOWS) {
+    try { process.kill(-child.pid, "SIGTERM"); } catch {}
+  }
+  if (child.exitCode === null && child.signalCode === null) {
+    const stopped = await signalAndWait(child.pid, "SIGTERM", 3000);
+    if (!stopped) {
+      p.log.warn(`Started engine pid ${child.pid} survived shutdown; lifecycle state was preserved.`);
+      return;
+    }
+  }
+  if (readEnginePidfile() === child.pid) {
+    clearEnginePidfile();
+    clearEngineState();
+  }
+}
 
 function printCapturedStartupStderr(): void {
   const stderr = redactCredentialUrls(activeStartupStderr.text().trim());
@@ -1410,6 +1538,7 @@ function printDockerStartupLogs(): void {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 5000,
+      killSignal: "SIGKILL",
       maxBuffer: 64 * 1024,
     },
   );
@@ -1429,6 +1558,8 @@ function spawnEngineBackground(
 ): ChildProcess {
   vlog(`spawn: ${bin} ${spawnArgs.join(" ")}${cwd ? ` (cwd: ${cwd})` : ""}`);
   activeStartupStderr = createStartupStderrCapture();
+  startupFailure = null;
+  engineReadinessDeadline = startupDeadline(startupTimeouts().engineMs);
   const child = spawn(bin, spawnArgs, {
     detached: true,
     stdio: ["ignore", "ignore", "pipe"],
@@ -1437,15 +1568,31 @@ function spawnEngineBackground(
     ...(cwd ? { cwd } : {}),
   });
   const isDocker = label.includes("Docker");
-  if (!isDocker && typeof child.pid === "number") {
-    writeEnginePidfile(child.pid);
+  if (isDocker) spawnedDockerCommand = child;
+  if (!isDocker) {
+    spawnedNativeEngine = child;
+    if (typeof child.pid === "number") writeEnginePidfile(child.pid);
   }
+  child.on("error", (error) => {
+    if ((isDocker ? spawnedDockerCommand : spawnedNativeEngine) !== child) return;
+    startupFailure = {
+      kind: isDocker ? "docker-crashed" : "engine-crashed",
+      stderr: redactCredentialUrls(error.message),
+      binary: bin,
+    };
+    if (!isDocker && spawnedNativeEngine === child) {
+      clearEnginePidfile();
+      clearEngineState();
+    }
+  });
   child.stderr?.on("data", (chunk: Buffer) => {
+    if ((isDocker ? spawnedDockerCommand : spawnedNativeEngine) !== child) return;
     activeStartupStderr.append(chunk);
   });
+  (child.stderr as { unref?: () => void } | null)?.unref?.();
   child.on("exit", (code, signal) => {
-    const abnormal =
-      (code !== null && code !== 0) || (code === null && signal !== null);
+    if ((isDocker ? spawnedDockerCommand : spawnedNativeEngine) !== child) return;
+    const abnormal = !isDocker || (code !== null && code !== 0) || (code === null && signal !== null);
     if (abnormal) {
       const stderr = redactCredentialUrls(activeStartupStderr.text());
       startupFailure = {
@@ -1461,7 +1608,7 @@ function spawnEngineBackground(
       if (IS_VERBOSE && stderr.trim()) {
         p.log.error(`engine stderr:\n${stderr}`);
       }
-      if (!isDocker) {
+      if (!isDocker && readEnginePidfile() === child.pid) {
         clearEnginePidfile();
         clearEngineState();
       }
@@ -1571,6 +1718,7 @@ function startIiiBin(iiiBin: string, configPath: string): boolean {
   writeEngineState({
     kind: "native",
     configPath: launch.configPath,
+    cwd: launch.cwd,
     binPath: iiiBin,
   });
   spawnEngineBackground(
@@ -1607,6 +1755,8 @@ function warnIfDockerIgnoresStateBackend(stateBackendKind: "file" | "redis"): vo
 }
 
 async function startEngine(): Promise<boolean> {
+  startupFailure = null;
+  engineReadinessDeadline = null;
   let stateBackendKind: "file" | "redis";
   try {
     stateBackendKind = getStateBackend();
@@ -1638,12 +1788,13 @@ async function startEngine(): Promise<boolean> {
     persistDockerInspection(persistedState, inspection);
     if (inspection.status === "running") return true;
     const dockerBin = whichBinary("docker");
-    return Boolean(
-      dockerBin &&
-      runCommand(dockerBin, ["start", inspection.containerId], {
-        label: `Restarting owned Docker container ${inspection.containerId}`,
-      }),
-    );
+    if (!dockerBin) return false;
+    startedDockerEngine = persistDockerInspection(persistedState, inspection);
+    engineReadinessDeadline = startupDeadline(startupTimeouts().engineMs);
+    return runCommand(dockerBin, ["start", inspection.containerId], {
+      label: `Restarting owned Docker container ${inspection.containerId}`,
+      timeoutMs: startupTimeouts().engineMs,
+    });
   }
   const configPath = findIiiConfig();
   warnIfRelocatedDataDir();
@@ -1775,7 +1926,7 @@ async function startEngine(): Promise<boolean> {
     s.start("Starting iii-engine via Docker...");
     configureDockerHostUser();
     const projectName = dockerProjectName(getRestPort());
-    writeEngineState({
+    const dockerState: DockerEngineState = {
       kind: "docker",
       schemaVersion: 2,
       composeFile,
@@ -1784,7 +1935,14 @@ async function startEngine(): Promise<boolean> {
       dataMountType: "bind",
       dataMountSource: dataDirResolution.dataDir,
       preserveContainer: false,
-    });
+    };
+    const previous = inspectOwnedDockerEngine(dockerState);
+    if (previous.status === "missing" || previous.status === "stopped") {
+      startedDockerEngine = previous.status === "stopped"
+        ? persistDockerInspection(dockerState, previous)
+        : dockerState;
+    }
+    writeEngineState(dockerState);
     spawnEngineBackground(
       dockerBin,
       dockerComposeArgs(composeFile, projectName, ["up", "-d"]),
@@ -1802,13 +1960,19 @@ async function startEngine(): Promise<boolean> {
   return false;
 }
 
-async function waitForEngine(timeoutMs: number): Promise<boolean> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (await isEngineRunning()) return true;
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  return false;
+async function waitForEngine(timeoutMs = startupTimeouts().engineMs): Promise<boolean> {
+  return waitForReadiness(engineReadinessDeadline ?? startupDeadline(timeoutMs), (signal) => probeEngine(getBaseUrl(), signal), {
+    intervalMs: 500,
+    stopped: () => startupInterrupted || engineStartupFailed(),
+  });
+}
+
+async function waitForPersistedNativeEngine(): Promise<boolean> {
+  const state = readEngineState();
+  const pid = readEnginePidfile();
+  if (state?.kind !== "native" || !pid || !pidAlive(pid) || isForeignPortHolder(pidCommand(pid))) return false;
+  if (!(await waitForEngine())) throw new Error(startupTimeoutMessage("engine", startupTimeouts().engineMs));
+  return true;
 }
 
 async function reconcilePersistedDockerEngine(): Promise<boolean> {
@@ -1829,29 +1993,24 @@ async function reconcilePersistedDockerEngine(): Promise<boolean> {
   }
   persistDockerInspection(state, inspection);
   if (inspection.status === "stopped") {
+    startedDockerEngine = persistDockerInspection(state, inspection);
+    engineReadinessDeadline = startupDeadline(startupTimeouts().engineMs);
     const dockerBin = whichBinary("docker");
     if (
       !dockerBin ||
       !runCommand(dockerBin, ["start", inspection.containerId], {
         label: `Restarting owned Docker container ${inspection.containerId}`,
+        timeoutMs: startupTimeouts().engineMs,
       })
     ) {
-      p.log.error("The owned Docker container could not be restarted; lifecycle state was preserved.");
-      process.exit(1);
+      throw new Error("The owned Docker container could not be restarted; lifecycle state was preserved.");
     }
   }
-  if (!(await waitForEngine(5000))) {
+  if (!(await waitForEngine())) {
     printDockerStartupLogs();
-    p.log.error(
-      `The owned Docker container is running, but its REST API on port ${getRestPort()} is unhealthy. The saved project was preserved; inspect the Docker logs above or run \`agentmemory stop\`.`,
-    );
-    process.exit(1);
+    throw new Error(`${startupTimeoutMessage("engine", startupTimeouts().engineMs)} Docker ownership state was preserved.`);
   }
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
-    process.exit(1);
-  }
   await maybeOfferGlobalInstall();
   printReadyHint();
   return true;
@@ -1907,14 +2066,6 @@ function portInUseDiagnostic(port: number): string {
     : `  lsof -i :${port}   # or: ss -tlnp | grep :${port}`;
 }
 
-async function waitForAgentmemoryReady(timeoutMs: number): Promise<boolean> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (await isAgentmemoryReady()) return true;
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  return false;
-}
 
 // Derive a host string for the streams/engine WebSocket lines from
 // the configured engine URL (`III_ENGINE_URL`) or REST base
@@ -1970,6 +2121,7 @@ function printReadyHint(): void {
 }
 
 async function main() {
+  startupTimeouts();
   await assertRuntimePortOwnership();
   // Booting a second instance next to a live daemon registers a duplicate
   // worker on the running engine, and before iii 0.19.2 the second instance's
@@ -2011,19 +2163,19 @@ async function main() {
     await runOnboarding();
   }
 
+  beginStartup();
+
   if (skipEngine) {
     if (IS_VERBOSE) p.log.info("Skipping engine check (--no-engine)");
-    await import("./index.js");
-    if (await waitForAgentmemoryReady(15000)) {
-      await maybeOfferGlobalInstall();
-      printReadyHint();
-    }
+    await startWorkerForEngineState();
+    await maybeOfferGlobalInstall();
+    printReadyHint();
     return;
   }
 
   if (await reconcilePersistedDockerEngine()) return;
 
-  if (await isEngineRunning()) {
+  if (await isEngineRunning() || await waitForPersistedNativeEngine()) {
     if (IS_VERBOSE) p.log.success("iii-engine is running");
     // Prefer the binary path persisted at launch time over whatever's on
     // PATH now. PATH lookups misfire when a global iii install gets added
@@ -2050,10 +2202,6 @@ async function main() {
     if (detected === IIPINNED_VERSION) {
       adoptRunningEngine();
       await startWorkerForEngineState();
-      if (!(await waitForAgentmemoryReady(15000))) {
-        p.log.error("agentmemory worker did not become ready within 15s.");
-        process.exit(1);
-      }
       await maybeOfferGlobalInstall();
       printReadyHint();
       return;
@@ -2106,16 +2254,16 @@ async function main() {
       );
     }
     p.note(lines.join("\n"), "Setup required");
-    process.exit(1);
+    throw new Error("iii-engine could not be started.");
   }
 
   const s = p.spinner();
   s.start("Waiting for iii-engine to be ready...");
 
-  const ready = await waitForEngine(15000);
+  const ready = await waitForEngine();
   if (!ready) {
     const port = getRestPort();
-    s.stop("iii-engine did not become ready within 15s");
+    s.stop(startupTimeoutMessage("engine", startupTimeouts().engineMs));
     printDockerStartupLogs();
 
     if (startupFailure?.kind === "engine-crashed" || startupFailure?.kind === "docker-crashed") {
@@ -2156,15 +2304,11 @@ async function main() {
         "Troubleshooting",
       );
     }
-    process.exit(1);
+    throw new Error(engineStartupFailed() ? "iii-engine failed during startup." : startupTimeoutMessage("engine", startupTimeouts().engineMs));
   }
 
   s.stop(c.ok("iii-engine is ready"));
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
-    process.exit(1);
-  }
   await maybeOfferGlobalInstall();
   printReadyHint();
   // Mark splash as something to skip on subsequent runs. This is a
@@ -2215,8 +2359,8 @@ async function runStatus() {
     const version = healthRes?.version || "?";
     const sessionList = Array.isArray(sessionsRes?.sessions) ? sessionsRes.sessions : [];
     const sessions = sessionList.length;
-    const nodes = Number(graphRes?.totalNodes ?? graphRes?.nodes ?? graphRes?.nodeCount ?? 0);
-    const edges = Number(graphRes?.totalEdges ?? graphRes?.edges ?? graphRes?.edgeCount ?? 0);
+    const nodes = graphRes?.available === false ? "unknown" : graphRes?.totalNodes ?? graphRes?.nodes ?? graphRes?.nodeCount ?? "unknown";
+    const edges = graphRes?.available === false ? "unknown" : graphRes?.totalEdges ?? graphRes?.edges ?? graphRes?.edgeCount ?? "unknown";
     const cb = healthRes?.circuitBreaker?.state || "closed";
     const heapMB = h?.memory ? Math.round(h.memory.heapUsed / 1048576) : 0;
     const uptime = h?.uptimeSeconds ? Math.round(h.uptimeSeconds) : 0;
@@ -2440,6 +2584,7 @@ function buildDoctorEffects(): DoctorEffects {
     },
     runStop: async () => {
       try {
+        startupTimeouts();
         // runStop calls process.exit on its own — guard against that here
         // by short-circuiting when there's nothing to stop.
         const port = getRestPort();
@@ -2473,14 +2618,16 @@ function buildDoctorEffects(): DoctorEffects {
     },
     runStart: async () => {
       try {
+        startupTimeouts();
+        beginStartup();
         const started = await startEngine();
-        if (!started) return { ok: false, message: "startEngine() returned false" };
-        const ready = await waitForEngine(15000);
-        return {
-          ok: ready,
-          message: ready ? "Engine ready" : "Engine did not become ready within 15s",
-        };
+        if (!started) throw new Error("iii-engine could not be started.");
+        if (!(await waitForEngine())) throw new Error(startupTimeoutMessage("engine", startupTimeouts().engineMs));
+        await startWorkerForEngineState(true);
+        return { ok: true, message: "Engine and agentmemory worker ready" };
       } catch (err) {
+        await runStartupCleanup(1);
+        finishStartup();
         return {
           ok: false,
           message: err instanceof Error ? err.message : String(err),
@@ -2516,10 +2663,8 @@ async function passiveServerChecks(): Promise<DoctorCheck[]> {
 
   const hasLlm = flags?.provider === "llm";
   const hasEmbed = flags?.embeddingProvider === "embeddings";
-  const graphNodeCount = Number(
-    graph?.totalNodes ?? graph?.nodes ?? graph?.nodeCount ?? 0,
-  );
-  const graphHas = graphNodeCount > 0;
+  const graphNodeCount = graph?.available === false ? null : graph?.totalNodes ?? graph?.nodes ?? graph?.nodeCount ?? null;
+  const graphHas = typeof graphNodeCount === "number" && graphNodeCount > 0;
 
   checks.push(
     {
@@ -2587,7 +2732,9 @@ async function passiveServerChecks(): Promise<DoctorCheck[]> {
     ok: graphHas,
     hint: graphHas
       ? undefined
-      : "Graph is empty. Run a session with GRAPH_EXTRACTION_ENABLED=true.",
+      : graphNodeCount === null
+        ? "Graph counts are unavailable. Run agentmemory graph-index status."
+        : "Graph is empty. Run a session with GRAPH_EXTRACTION_ENABLED=true.",
   });
 
   return checks;
@@ -2978,50 +3125,34 @@ async function runInit() {
 }
 
 async function startServerForDemo(): Promise<() => Promise<void>> {
+  startupTimeouts();
   await assertRuntimePortOwnership();
   if (await isAgentmemoryReady()) {
     return async () => {};
   }
 
-  const startedEngine = !(await isEngineRunning());
+  beginStartup();
+
+  const startedEngine = !skipEngine && !(await isEngineRunning() || await waitForPersistedNativeEngine());
   if (startedEngine) {
     const ok = await startEngine();
     if (!ok) {
       p.log.error("Could not start iii-engine for the demo.");
       p.note(installInstructions().join("\n"), "Setup required");
-      process.exit(1);
+      throw new Error("iii-engine could not be started for the demo.");
     }
-    if (!(await waitForEngine(15000))) {
+    if (!(await waitForEngine())) {
       printCapturedStartupStderr();
       printDockerStartupLogs();
-      p.log.error("iii-engine did not become ready within 15s.");
-      process.exit(1);
+      throw new Error(startupTimeoutMessage("engine", startupTimeouts().engineMs));
     }
   }
 
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
-    process.exit(1);
-  }
 
   return async () => {
-    if (!startedEngine) return;
-    const port = getRestPort();
-    const state = readEngineState();
-    if (state?.kind === "docker") {
-      await stopDockerEngine(state, port).catch(() => {});
-      return;
-    }
-    const pids = new Set<number>(findEnginePidsByPort(port));
-    const pidfilePid = readEnginePidfile();
-    if (pidfilePid) pids.add(pidfilePid);
-    for (const pid of pids) {
-      await signalAndWait(pid, "SIGTERM", 3000).catch(() => {});
-    }
-    clearEnginePidfile();
-    clearEngineState();
-    clearWorkerPidfile();
+    if (importedStartupWorker && readWorkerPidfile() === process.pid) clearWorkerPidfile();
+    if (startedEngine) await cleanupFailedStartup();
   };
 }
 
@@ -3123,7 +3254,7 @@ async function runDemoBody(base: string) {
 function runCommand(
   command: string,
   commandArgs: string[],
-  options: { cwd?: string; label: string; optional?: boolean } = { label: "command" },
+  options: { cwd?: string; label: string; optional?: boolean; timeoutMs?: number } = { label: "command" },
 ): boolean {
   const spinner = p.spinner();
   spinner.start(options.label);
@@ -3131,6 +3262,7 @@ function runCommand(
     cwd: options.cwd || process.cwd(),
     stdio: "pipe",
     encoding: "utf-8",
+    ...(options.timeoutMs !== undefined ? { timeout: options.timeoutMs, killSignal: "SIGKILL" as const } : {}),
   });
 
   if (result.status === 0) {
@@ -4109,6 +4241,21 @@ async function runCapture(): Promise<void> {
   process.exit(code);
 }
 
+async function runCompression(): Promise<void> {
+  const base = getBaseUrl();
+  const code = await runCompressionCommand({
+    base,
+    args: args.slice(1),
+    secret: resolveClientSecret(base),
+  });
+  process.exit(code);
+}
+
+async function runGraphIndex(): Promise<void> {
+  const base = getBaseUrl();
+  process.exit(await runGraphIndexCommand({ base, args: args.slice(1), secret: resolveClientSecret(base) }));
+}
+
 const commands: Record<string, () => Promise<void>> = {
   init: runInit,
   connect: runConnectCmd,
@@ -4122,6 +4269,8 @@ const commands: Record<string, () => Promise<void>> = {
   mcp: runMcp,
   "import-jsonl": runImportJsonl,
   capture: runCapture,
+  compression: runCompression,
+  "graph-index": runGraphIndex,
 };
 
 const first = args[0] ?? "";
@@ -4136,7 +4285,8 @@ async function unknownCommand(): Promise<void> {
 // `agentmemory consolidate`) fell through to the full server boot and could
 // break a running daemon.
 const handler = commands[first] ?? (first && !first.startsWith("-") ? unknownCommand : main);
-handler().catch((err) => {
+handler().catch(async (err) => {
   p.log.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
+  const exitCode = await runStartupCleanup(1).catch(() => 1);
+  process.exit(exitCode);
 });

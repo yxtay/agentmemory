@@ -47,7 +47,7 @@ function setup(seed: Record<string, Record<string, unknown>>) {
   };
   const kv = mockKV(seed);
   registerApiTriggers(sdk as never, kv as never);
-  return { handlers, kv };
+  return { handlers, kv, sdk };
 }
 
 async function call(handlers: Map<string, Handler>, id: string, query_params: Record<string, string>) {
@@ -198,6 +198,24 @@ describe("paginated and filtered list endpoints", () => {
     expect((search.body.sessions as Array<{ id: string }>).map((s) => s.id)).toEqual(["s2"]);
   });
 
+  it("applies session time bounds before paging and rejects invalid ones", async () => {
+    const sessions: Record<string, unknown> = {};
+    for (let i = 0; i < 5; i++) {
+      sessions[`s${i}`] = { id: `s${i}`, startedAt: `2026-09-0${i + 1}T00:00:00Z` };
+    }
+    const { handlers } = setup({ [KV.sessions]: sessions });
+    const bounds = { startedAfter: "2026-09-02", startedBefore: "2026-09-05", limit: "2" };
+
+    const page = await call(handlers, "api::sessions", bounds);
+    expect((page.body.sessions as Array<{ id: string }>).map((s) => s.id)).toEqual(["s3", "s2"]);
+    const next = await call(handlers, "api::sessions", { ...bounds, cursor: page.body.nextCursor as string });
+    expect((next.body.sessions as Array<{ id: string }>).map((s) => s.id)).toEqual(["s1"]);
+    expect(next.body.nextCursor).toBeNull();
+
+    expect((await call(handlers, "api::sessions", { startedAfter: "2026-02-30" })).status_code).toBe(400);
+    expect((await call(handlers, "api::sessions", { endedBefore: "" })).status_code).toBe(400);
+  });
+
   it("filters and pages observations inside a session", async () => {
     const observations: Record<string, unknown> = {};
     for (let i = 0; i < 5; i++) {
@@ -268,5 +286,30 @@ describe("paginated and filtered list endpoints", () => {
     const bad = await call(handlers, "api::observations-locate", {});
     expect(bad.status_code).toBe(400);
     index.remove("obs_locate_1");
+  });
+
+  it("forwards action pagination parameters and returns the next cursor", async () => {
+    const { handlers, sdk } = setup({});
+    const firstPage = {
+      success: true,
+      actions: [{ id: "act_1" }, { id: "act_2" }],
+      nextCursor: "next-page",
+    };
+    sdk.trigger.mockResolvedValueOnce(firstPage as never);
+
+    const first = await call(handlers, "api::action-list", { limit: "2" });
+    expect(first.body).toEqual(firstPage);
+    expect(sdk.trigger).toHaveBeenLastCalledWith({
+      function_id: "mem::action-list",
+      payload: { status: undefined, project: undefined, parentId: undefined, limit: 2, cursor: undefined },
+    });
+
+    sdk.trigger.mockResolvedValueOnce({ ...firstPage, actions: [{ id: "act_3" }], nextCursor: null } as never);
+    const second = await call(handlers, "api::action-list", { limit: "2", cursor: "next-page" });
+    expect(second.body.nextCursor).toBeNull();
+    expect(sdk.trigger).toHaveBeenLastCalledWith({
+      function_id: "mem::action-list",
+      payload: { status: undefined, project: undefined, parentId: undefined, limit: 2, cursor: "next-page" },
+    });
   });
 });

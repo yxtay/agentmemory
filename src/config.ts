@@ -17,11 +17,19 @@ function safeParseInt(value: string | undefined, fallback: number): number {
   return Number.isNaN(parsed) ? fallback : parsed;
 }
 
+// Import-side ceiling for observations in a single session (enforced by
+// mem::import). Deliberately NOT named MAX_OBS_PER_SESSION — that env var is
+// the runtime write cap and the two are independent; loadConfig() warns when
+// the runtime cap is raised past this ceiling, which would let a session grow
+// past the point where export→import round-trips can restore the store.
+export const MAX_IMPORT_OBS_PER_SESSION = 5_000;
+
 const DATA_DIR = join(homedir(), ".agentmemory");
 const ENV_FILE = join(DATA_DIR, ".env");
 
 let warnPremiumModelShown = false;
 let providerNoticeShown = false;
+let obsCapImportCeilingWarned = false;
 
 function writeProviderNoticeOnce(text: string): void {
   if (providerNoticeShown) return;
@@ -90,14 +98,40 @@ export function hydrateProcessEnvFromFile(): void {
   }
 }
 
+// Warn once when a configured model is in the premium tier and likely to burn
+// money on background compression. Captured workload data shows ~$5/35h on
+// claude-sonnet-4 vs ~$0.46/35h on deepseek-v4-pro for the same compression
+// mix. Heuristic match avoids hard-coding a pricing table.
+function warnIfPremiumModel(env: Record<string, string>, envName: string, model: string): void {
+  if (
+    warnPremiumModelShown ||
+    !/sonnet|opus|gpt-5\.\d+-sol|gpt-4o(?!.*mini)|gpt-4-turbo/i.test(model) ||
+    env["AGENTMEMORY_SUPPRESS_COST_WARNING"] === "1" ||
+    env["AGENTMEMORY_SUPPRESS_COST_WARNING"] === "true"
+  ) {
+    return;
+  }
+  warnPremiumModelShown = true;
+  process.stderr.write(
+    `[agentmemory] ${envName}=${model} is in the premium tier. ` +
+      `Background compression on this model can cost $5+/day under active use. ` +
+      `Cheaper alternatives with comparable quality for memory compression: ` +
+      `deepseek/deepseek-v4-flash-0731, deepseek/deepseek-v4-pro, qwen/qwen3-coder. ` +
+      `See README "Cost-aware model selection" for the full table. ` +
+      `Set AGENTMEMORY_SUPPRESS_COST_WARNING=1 to silence.\n`,
+  );
+}
+
 function detectProvider(env: Record<string, string>): ProviderConfig {
   const maxTokens = parseInt(env["MAX_TOKENS"] || "4096", 10);
 
   // OpenAI-compatible: supports OpenAI, DeepSeek, SiliconFlow, Azure, vLLM, LM Studio
   if (hasRealValue(env["OPENAI_API_KEY"]) && env["OPENAI_API_KEY_FOR_LLM"] !== "false") {
+    const model = env["OPENAI_MODEL"] || "gpt-5.6-luna";
+    warnIfPremiumModel(env, "OPENAI_MODEL", model);
     return {
       provider: "openai",
-      model: env["OPENAI_MODEL"] || "gpt-5.6-luna",
+      model,
       maxTokens,
       baseURL: env["OPENAI_BASE_URL"],
     };
@@ -135,27 +169,7 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
   }
   if (hasRealValue(env["OPENROUTER_API_KEY"])) {
     const model = env["OPENROUTER_MODEL"] || "anthropic/claude-sonnet-5";
-    // warn when the configured OpenRouter model is in the
-    // premium tier and likely to burn money on background compression.
-    // Captured workload data shows ~$5/35h on claude-sonnet-4 vs
-    // ~$0.46/35h on deepseek-v4-pro for the same compression mix.
-    // Heuristic match avoids hard-coding a pricing table.
-    if (
-      !warnPremiumModelShown &&
-      /sonnet|opus|gpt-5\.\d+-sol|gpt-4o(?!.*mini)|gpt-4-turbo/i.test(model) &&
-      env["AGENTMEMORY_SUPPRESS_COST_WARNING"] !== "1" &&
-      env["AGENTMEMORY_SUPPRESS_COST_WARNING"] !== "true"
-    ) {
-      warnPremiumModelShown = true;
-      process.stderr.write(
-        `[agentmemory] OPENROUTER_MODEL=${model} is in the premium tier. ` +
-          `Background compression on this model can cost $5+/day under active use. ` +
-          `Cheaper alternatives with comparable quality for memory compression: ` +
-          `deepseek/deepseek-v4-flash-0731, deepseek/deepseek-v4-pro, qwen/qwen3-coder. ` +
-          `See README "Cost-aware model selection" for the full table. ` +
-          `Set AGENTMEMORY_SUPPRESS_COST_WARNING=1 to silence.\n`,
-      );
-    }
+    warnIfPremiumModel(env, "OPENROUTER_MODEL", model);
     return {
       provider: "openrouter",
       model,
@@ -214,6 +228,30 @@ export function loadConfig(): AgentMemoryConfig {
       parseInt(env["III_ENGINE_PORT"] || "", 10) || restPort + 46023
     }`;
 
+  const maxObservationsPerSession = safeParseInt(
+    env["MAX_OBS_PER_SESSION"],
+    500,
+  );
+  if (
+    !obsCapImportCeilingWarned &&
+    (maxObservationsPerSession === 0 ||
+      maxObservationsPerSession > MAX_IMPORT_OBS_PER_SESSION)
+  ) {
+    obsCapImportCeilingWarned = true;
+    const capDesc =
+      maxObservationsPerSession === 0
+        ? "uncapped (0)"
+        : String(maxObservationsPerSession);
+    process.stderr.write(
+      `[agentmemory] WARNING: MAX_OBS_PER_SESSION is ${capDesc}, above the ` +
+        `${MAX_IMPORT_OBS_PER_SESSION}-per-session import ceiling ` +
+        `(MAX_IMPORT_OBS_PER_SESSION). Sessions past that ceiling make every ` +
+        `mem::export -> mem::import restore fail wholesale. Keep ` +
+        `MAX_OBS_PER_SESSION at or below ${MAX_IMPORT_OBS_PER_SESSION} if you ` +
+        `rely on export/import backups.\n`,
+    );
+  }
+
   return {
     engineUrl,
     restPort,
@@ -221,7 +259,7 @@ export function loadConfig(): AgentMemoryConfig {
     viewerPort,
     provider,
     tokenBudget: safeParseInt(env["TOKEN_BUDGET"], 2000),
-    maxObservationsPerSession: safeParseInt(env["MAX_OBS_PER_SESSION"], 500),
+    maxObservationsPerSession,
     compressionModel: provider.model,
     dataDir: DATA_DIR,
   };
@@ -310,6 +348,19 @@ export function detectLlmProviderKind(
     return "llm";
   }
   return "noop";
+}
+
+export function describeLlmRoute(provider: ProviderConfig): string | null {
+  if (provider.provider === "noop") return null;
+  const parts = [provider.provider, provider.model];
+  if (provider.baseURL) {
+    try {
+      parts.push(new URL(provider.baseURL).host);
+    } catch {
+      parts.push("custom base URL");
+    }
+  }
+  return parts.join(" · ");
 }
 
 export function loadEmbeddingConfig(): EmbeddingConfig {

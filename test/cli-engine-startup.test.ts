@@ -30,13 +30,13 @@ describe("fresh native engine startup", () => {
     );
     expect(spawnBody).toContain("activeStartupStderr.append(chunk)");
 
-    const timeoutStart = source.indexOf("const ready = await waitForEngine(15000)");
+    const timeoutStart = source.indexOf("const ready = await waitForEngine()");
     const timeoutEnd = source.indexOf('s.stop(c.ok("iii-engine is ready"))', timeoutStart);
     expect(source.slice(timeoutStart, timeoutEnd)).toContain(
       "printCapturedStartupStderr()",
     );
 
-    const demoTimeoutStart = source.indexOf("await waitForEngine(15000)", timeoutEnd);
+    const demoTimeoutStart = source.indexOf("await waitForEngine()", timeoutEnd);
     const demoTimeoutEnd = source.indexOf("await import(\"./index.js\")", demoTimeoutStart);
     expect(source.slice(demoTimeoutStart, demoTimeoutEnd)).toContain(
       "printCapturedStartupStderr()",
@@ -88,11 +88,13 @@ describe("fresh native engine startup", () => {
     const workerBody = source.slice(workerStart, workerEnd);
     expect(workerBody).toContain("readWorkerPidfile()");
     expect(workerBody).toContain("pidAlive(workerPid)");
-    expect(workerBody).toContain("waitForConfiguredWorker");
+    expect(workerBody).toContain("startWorkerAndWait");
+    expect(workerBody).toContain("engineStartsWorker: configuredEngineMayStartWorker");
     expect(workerBody).toContain('await import("./index.js")');
 
-    expect(source.match(/await startWorkerForEngineState\(\)/g)).toHaveLength(4);
-    expect(source).toContain("agentmemory worker did not become ready within 15s");
+    expect(source.match(/await startWorkerForEngineState\(\)/g)).toHaveLength(5);
+    expect(source).toContain('startupTimeoutMessage("worker", timeoutMs)');
+    expect(source).not.toContain("waitForAgentmemoryReady(15000)");
   });
 
   it("stores lifecycle metadata per resolved instance and scopes Docker", () => {
@@ -105,7 +107,7 @@ describe("fresh native engine startup", () => {
   });
 
   it("keeps AGENTMEMORY_URL client-only and lets local port flags win", () => {
-    expect(source).toContain('const URL_CLIENT_COMMANDS = new Set(["status", "doctor", "mcp", "capture"])');
+    expect(source).toContain('const URL_CLIENT_COMMANDS = new Set(["status", "doctor", "mcp", "capture", "compression", "graph-index"])');
     expect(source).toContain("hasExplicitLocalPortOverride");
     expect(source).toContain("shouldUseAgentmemoryUrl()");
     expect(source).toContain('process.env["III_REST_PORT"] = String(base)');
@@ -125,7 +127,7 @@ describe("fresh native engine startup", () => {
     const mainBody = source.slice(mainStart, mainEnd);
     expect(mainBody).toContain("reconcilePersistedDockerEngine()");
     expect(mainBody.indexOf("reconcilePersistedDockerEngine()"))
-      .toBeLessThan(mainBody.indexOf("if (await isEngineRunning())"));
+      .toBeLessThan(mainBody.indexOf("if (await isEngineRunning() ||"));
   });
 
   it("keeps canonical compatibility and rejects Docker ownership on another port", () => {

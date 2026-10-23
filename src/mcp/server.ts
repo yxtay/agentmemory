@@ -2,6 +2,7 @@ import type { IIIClient } from "iii-sdk";
 import type { HttpRequest } from "@iii-dev/helpers/http";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
+import { pinGraphState } from "../state/graph-generation.js";
 import type {
   SessionSummary,
   Memory,
@@ -11,6 +12,7 @@ import type {
 } from "../types.js";
 import { getVisibleTools } from "./tools-registry.js";
 import { parseSearchExpansionIds } from "./search-arguments.js";
+import { parseSessionArguments } from "./session-arguments.js";
 import { isSearchLayer } from "../state/search-layer.js";
 import { checkAuth } from "../triggers/api.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
@@ -249,12 +251,21 @@ export function registerMcpEndpoints(
           }
 
           case "memory_sessions": {
-            const sessions = await kv.list(KV.sessions);
+            let query: Record<string, string>;
+            try { query = parseSessionArguments(args); }
+            catch (error) {
+              return { status_code: 400, body: { error: (error as Error).message } };
+            }
+            const result = await sdk.trigger({
+              function_id: "api::sessions",
+              payload: { headers: req.headers, query_params: query },
+            }) as McpResponse;
+            if (result.status_code !== 200) return result;
             return {
               status_code: 200,
               body: {
                 content: [
-                  { type: "text", text: JSON.stringify({ sessions }, null, 2) },
+                  { type: "text", text: JSON.stringify(result.body, null, 2) },
                 ],
               },
             };
@@ -372,7 +383,25 @@ export function registerMcpEndpoints(
           }
 
           case "memory_export": {
-            const result = await sdk.trigger({ function_id: "mem::export", payload: {} });
+            const exportPayload: {
+              maxSessions?: number;
+              offset?: number;
+              collectionLimit?: number;
+              collectionOffset?: number;
+              collections?: string;
+            } = {};
+            for (const key of ["maxSessions", "collectionLimit"] as const) {
+              const n = Number(args[key]);
+              if (Number.isInteger(n) && n > 0) exportPayload[key] = n;
+            }
+            for (const key of ["offset", "collectionOffset"] as const) {
+              const n = Number(args[key]);
+              if (Number.isInteger(n) && n >= 0) exportPayload[key] = n;
+            }
+            if (typeof args.collections === "string") {
+              exportPayload.collections = args.collections;
+            }
+            const result = await sdk.trigger({ function_id: "mem::export", payload: exportPayload });
             return {
               status_code: 200,
               body: {
@@ -1484,8 +1513,9 @@ export function registerMcpEndpoints(
 
         if (uri === "agentmemory://graph/stats") {
           try {
-            const nodes = await kv.list<GraphNode>(KV.graphNodes);
-            const edges = await kv.list<GraphEdge>(KV.graphEdges);
+            const graphState = await pinGraphState(kv);
+            const nodes = await graphState.list<GraphNode>(KV.graphNodes);
+            const edges = await graphState.list<GraphEdge>(KV.graphEdges);
             const nodesByType: Record<string, number> = {};
             for (const n of nodes)
               nodesByType[n.type] = (nodesByType[n.type] || 0) + 1;

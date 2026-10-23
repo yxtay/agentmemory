@@ -134,8 +134,16 @@ export const CORE_TOOLS: McpToolDef[] = [
   {
     name: "memory_sessions",
     description:
-      "List recent sessions with their status and observation counts.",
-    inputSchema: { type: "object", properties: {} },
+      "List recent sessions with status, observation counts, summaries and a continuation cursor. Filters apply before pagination; retain them when requesting the next page.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Exact project identifier used when sessions were started" },
+        agentId: { type: "string", description: "Filter by owning agent; '*' reads across agents" },
+        limit: { type: "integer", description: "Page size (default 20, max 100)" },
+        cursor: { type: "string", description: "nextCursor from the previous page; omit for the first page" },
+      },
+    },
   },
   {
     name: "memory_smart_search",
@@ -215,8 +223,32 @@ export const CORE_TOOLS: McpToolDef[] = [
   },
   {
     name: "memory_export",
-    description: "Export all memory data as JSON.",
-    inputSchema: { type: "object", properties: {} },
+    description:
+      "Export memory data as JSON. Past the transport size limit the export is refused, so use the paging arguments on a large store.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        maxSessions: {
+          type: "number",
+          description: "Sessions per page (with their observations)",
+        },
+        offset: { type: "number", description: "Session offset" },
+        collectionLimit: {
+          type: "number",
+          description:
+            "Rows per page for memories, summaries, graphNodes, lessons and the other top-level collections; access logs follow the memories on the page. Sessions and their observations are paged only by maxSessions and offset, so pass collections to leave them out of each page",
+        },
+        collectionOffset: {
+          type: "number",
+          description: "Row offset for the top-level collections",
+        },
+        collections: {
+          type: "string",
+          description:
+            "Comma-separated collections to return, e.g. memories,lessons. Sessions and their observations come back only when the list names sessions, access logs only together with memories. Unknown names are ignored. Omit for everything. A paged or selected export cannot be imported with strategy replace.",
+        },
+      },
+    },
   },
   {
     name: "memory_relations",
